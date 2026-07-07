@@ -23,6 +23,8 @@ BINARY_PATH="/usr/local/bin/ss-rust"
 CONFIG_PATH="/etc/ss-rust/config.json"
 VERSION_FILE="/etc/ss-rust/ver.txt"
 SYSCTL_CONF="/etc/sysctl.d/local.conf"
+SYSTEMD_DIR="/etc/systemd/system"
+OPENRC_DIR="/etc/init.d"
 MAINLAND_BLOCK_SCRIPT="/usr/local/bin/block-mainland.sh"
 MAINLAND_EXTRACT_SCRIPT="/usr/local/bin/extract-cn-ip-from-mmdb.py"
 MAINLAND_BLOCK_REPO_URL="https://raw.githubusercontent.com/jinqians/ss-2022.sh/refs/heads/main/block-mainland.sh"
@@ -46,6 +48,7 @@ readonly SUCCESS="${GREEN}[成功]${PLAIN}"
 OS_TYPE=""
 OS_ARCH=""
 OS_VERSION=""
+INIT_SYSTEM=""
 
 # 配置信息
 SS_PORT=""
@@ -69,6 +72,39 @@ check_root() {
 
 # 检测操作系统
 detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        local os_id="${ID:-}"
+        local os_like="${ID_LIKE:-}"
+        os_id="${os_id,,}"
+        os_like="${os_like,,}"
+
+        case "${os_id}" in
+            alpine)
+                OS_TYPE="alpine"
+                ;;
+            debian|ubuntu)
+                OS_TYPE="${os_id}"
+                ;;
+            centos|rhel|rocky|almalinux|fedora)
+                OS_TYPE="centos"
+                ;;
+        esac
+
+        if [[ -z "${OS_TYPE}" ]]; then
+            if [[ "${os_like}" == *"alpine"* ]]; then
+                OS_TYPE="alpine"
+            elif [[ "${os_like}" == *"debian"* ]]; then
+                OS_TYPE="debian"
+            elif [[ "${os_like}" == *"rhel"* || "${os_like}" == *"fedora"* ]]; then
+                OS_TYPE="centos"
+            fi
+        fi
+
+        [[ -n "${OS_TYPE}" ]] && return 0
+    fi
+
     if [[ -f /etc/redhat-release ]]; then
         OS_TYPE="centos"
     elif grep -q -E -i "debian" /etc/issue; then
@@ -89,7 +125,133 @@ detect_os() {
 }
 
 # 检测系统架构
+is_musl_system() {
+    [[ "${OS_TYPE}" == "alpine" ]] && return 0
+    ldd --version 2>&1 | grep -qi musl
+}
+
+detect_init_system() {
+    [[ -z "${OS_TYPE}" ]] && detect_os
+
+    if [[ "${OS_TYPE}" == "alpine" ]]; then
+        if command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+            INIT_SYSTEM="openrc"
+            return 0
+        fi
+        error_exit "Alpine requires OpenRC. Please install openrc first."
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    else
+        error_exit "Unsupported service manager. Need systemd or OpenRC."
+    fi
+}
+
+service_start() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl start "$1" ;;
+        openrc) rc-service "$1" start ;;
+    esac
+}
+
+service_stop() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl stop "$1" ;;
+        openrc) rc-service "$1" stop ;;
+    esac
+}
+
+service_restart() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl restart "$1" ;;
+        openrc) rc-service "$1" restart ;;
+    esac
+}
+
+service_enable() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl enable "$1" ;;
+        openrc) rc-update add "$1" default ;;
+    esac
+}
+
+service_disable() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl disable "$1" ;;
+        openrc) rc-update del "$1" default >/dev/null 2>&1 || true ;;
+    esac
+}
+
+service_is_active() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl is-active "$1" >/dev/null 2>&1 ;;
+        openrc) rc-service "$1" status >/dev/null 2>&1 ;;
+    esac
+}
+
+service_status() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl status "$1" ;;
+        openrc) rc-service "$1" status ;;
+    esac
+}
+
+service_reload() {
+    detect_init_system
+    [[ "${INIT_SYSTEM}" == "systemd" ]] && systemctl daemon-reload
+    return 0
+}
+
+show_service_logs() {
+    detect_init_system
+    if [[ "${INIT_SYSTEM}" == "systemd" ]]; then
+        journalctl -xe --unit "$1"
+    else
+        tail -n 80 "/var/log/${1}.err" "/var/log/${1}.log" 2>/dev/null || true
+    fi
+}
+
+print_service_debug_hint() {
+    detect_init_system
+    if [[ "${INIT_SYSTEM}" == "systemd" ]]; then
+        echo -e " - systemctl status $1"
+        echo -e " - journalctl -xe --unit $1"
+    else
+        echo -e " - rc-service $1 status"
+        echo -e " - tail -n 80 /var/log/$1.err /var/log/$1.log"
+    fi
+}
+
+get_shadowtls_ss_service_file() {
+    local path
+    for path in "${SYSTEMD_DIR}/shadowtls-ss.service" "${OPENRC_DIR}/shadowtls-ss"; do
+        [[ -f "${path}" ]] && echo "${path}" && return 0
+    done
+    return 1
+}
+
+extract_shadowtls_listen_port() {
+    sed -n 's/.*--listen[[:space:]]\+::0:\([0-9][0-9]*\).*/\1/p' "$1" | head -1
+}
+
+extract_shadowtls_arg() {
+    local file="$1"
+    local arg="$2"
+    sed -n "s/.*--${arg}[[:space:]]\\+\\([^[:space:]]*\\).*/\\1/p" "${file}" | head -1 | sed 's/^"//;s/"$//'
+}
+
 detect_arch() {
+    [[ -z "${OS_TYPE}" ]] && detect_os
     local arch=$(uname -m)
     local os=$(uname -s)
     
@@ -105,23 +267,29 @@ detect_arch() {
             esac
             ;;
         "Linux")
+            local libc="gnu"
+            is_musl_system && libc="musl"
             case "${arch}" in
                 "x86_64")
-                    OS_ARCH="x86_64-unknown-linux-gnu"
+                    OS_ARCH="x86_64-unknown-linux-${libc}"
                     ;;
                 "aarch64")
-                    OS_ARCH="aarch64-unknown-linux-gnu"
+                    OS_ARCH="aarch64-unknown-linux-${libc}"
                     ;;
                 "armv7l"|"armv7")
                     # 检查是否支持硬浮点
-                    if grep -q "gnueabihf" /proc/cpuinfo; then
-                        OS_ARCH="armv7-unknown-linux-gnueabihf"
+                    if [[ "${libc}" == "musl" ]]; then
+                        OS_ARCH="armv7-unknown-linux-musleabihf"
                     else
-                        OS_ARCH="arm-unknown-linux-gnueabi"
+                        OS_ARCH="armv7-unknown-linux-gnueabihf"
                     fi
                     ;;
                 "armv6l")
-                    OS_ARCH="arm-unknown-linux-gnueabi"
+                    if [[ "${libc}" == "musl" ]]; then
+                        OS_ARCH="arm-unknown-linux-musleabi"
+                    else
+                        OS_ARCH="arm-unknown-linux-gnueabi"
+                    fi
                     ;;
                 "i686"|"i386")
                     OS_ARCH="i686-unknown-linux-musl"
@@ -148,8 +316,11 @@ check_installation() {
 
 # 检查服务状态
 check_service_status() {
-    local status=$(systemctl is-active ss-rust)
-    echo "${status}"
+    if service_is_active ss-rust; then
+        echo "active"
+    else
+        echo "inactive"
+    fi
 }
 
 # 获取最新版本
@@ -175,13 +346,13 @@ Tip="${Yellow_font_prefix}[注意]${Font_color_suffix}"
 check_installed_status() {
     if [[ ! -e ${BINARY_PATH} ]]; then
         echo -e "${Error} Shadowsocks Rust 没有安装，请检查！"
-        return 1
+        return 0
     fi
     return 0
 }
 
 check_status() {
-    if systemctl is-active ss-rust >/dev/null 2>&1; then
+    if service_is_active ss-rust; then
         status="running"
     else
         status="stopped"
@@ -348,7 +519,10 @@ download() {
 # 安装系统服务
 install_service() {
     echo -e "${INFO} 开始安装系统服务..."
-    cat > /etc/systemd/system/ss-rust.service << EOF
+    detect_init_system
+
+    if [[ "${INIT_SYSTEM}" == "systemd" ]]; then
+        cat > "${SYSTEMD_DIR}/ss-rust.service" << EOF
 [Unit]
 Description=Shadowsocks Rust Service
 After=network-online.target
@@ -365,12 +539,39 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+    else
+        cat > "${OPENRC_DIR}/ss-rust" << EOF
+#!/sbin/openrc-run
+name="ss-rust"
+description="Shadowsocks Rust Service"
+
+command="${BINARY_PATH}"
+command_args="-c ${CONFIG_PATH}"
+command_user="root"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/ss-rust.log"
+error_log="/var/log/ss-rust.err"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --mode 0755 /run
+    checkpath --file --mode 0644 "\${output_log}"
+    checkpath --file --mode 0644 "\${error_log}"
+}
+EOF
+        chmod +x "${OPENRC_DIR}/ss-rust"
+    fi
 
     echo -e "${INFO} 重新加载 systemd 配置..."
-    systemctl daemon-reload
+    service_reload
     
     echo -e "${INFO} 启用 ss-rust 服务..."
-    systemctl enable ss-rust
+    service_enable ss-rust
     
     echo -e "${SUCCESS} Shadowsocks Rust 服务配置完成！"
 }
@@ -382,6 +583,14 @@ install_dependencies() {
     if [[ ${OS_TYPE} == "centos" ]]; then
         yum update -y
         yum install -y jq gzip wget curl unzip xz openssl qrencode tar
+    elif [[ ${OS_TYPE} == "alpine" ]]; then
+        apk update
+        apk add --no-cache bash jq gzip wget curl unzip xz openssl tar tzdata ca-certificates openrc iptables ip6tables iproute2 coreutils || true
+        apk add --no-cache qrencode >/dev/null 2>&1 || apk add --no-cache libqrencode-tools >/dev/null 2>&1 || true
+        update-ca-certificates >/dev/null 2>&1 || true
+        for cmd in bash jq gzip wget curl unzip xz openssl tar iptables ip6tables ip shuf; do
+            command -v "$cmd" >/dev/null 2>&1 || error_exit "Missing required command after apk install: $cmd"
+        done
     else
         apt-get update
         apt-get install -y jq gzip wget curl unzip xz-utils openssl qrencode tar
@@ -448,15 +657,21 @@ check_firewall() {
     if command -v iptables >/dev/null 2>&1; then
         echo -e "${INFO} 检测到 iptables 防火墙..."
         echo -e "${INFO} 正在将端口 ${port} 加入 iptables 规则..."
-        iptables -I INPUT -p tcp --dport ${port} -j ACCEPT
-        iptables -I INPUT -p udp --dport ${port} -j ACCEPT
+        iptables -I INPUT -p tcp --dport ${port} -j ACCEPT || echo -e "${WARNING} 无法自动放行 ${port}/tcp，请手动配置防火墙"
+        iptables -I INPUT -p udp --dport ${port} -j ACCEPT || echo -e "${WARNING} 无法自动放行 ${port}/udp，请手动配置防火墙"
         echo -e "${SUCCESS} iptables 端口开放完成！"
         
         # 保存 iptables 规则
         if [[ ${OS_TYPE} == "centos" ]]; then
-            service iptables save
+            service iptables save || true
+        elif [[ ${OS_TYPE} == "alpine" ]]; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules-save 2>/dev/null || iptables-save > /etc/iptables.rules || true
+            if command -v rc-service >/dev/null 2>&1 && [[ -x /etc/init.d/iptables ]]; then
+                rc-update add iptables boot >/dev/null 2>&1 || true
+            fi
         else
-            iptables-save > /etc/iptables.rules
+            iptables-save > /etc/iptables.rules || true
         fi
     fi
 }
@@ -747,7 +962,11 @@ Install() {
     install_service
 
     echo -e "${Info} 创建命令快捷方式..."
-    curl -L -s ss.jinqians.com -o "/usr/local/bin/ss-2022.sh"
+    if [[ -r "${BASH_SOURCE[0]}" ]]; then
+        cp "${BASH_SOURCE[0]}" "/usr/local/bin/ss-2022.sh"
+    else
+        curl -L -s ss.jinqians.com -o "/usr/local/bin/ss-2022.sh"
+    fi
     chmod +x "/usr/local/bin/ss-2022.sh"
     if [ -f "/usr/local/bin/ssrust" ]; then
         rm -f "/usr/local/bin/ssrust"
@@ -755,9 +974,7 @@ Install() {
     ln -s "/usr/local/bin/ss-2022.sh" "/usr/local/bin/ssrust"
     
     echo -e "${Info} 所有步骤安装完毕，开始启动服务..."
-    start_service
-    
-    if [[ "$?" == "0" ]]; then
+    if start_service; then
         echo -e "${Success} Shadowsocks Rust 安装并启动成功！"
         View
         echo -e "${Info} 您可以使用 ${Green_font_prefix}ssrust${Font_color_suffix} 命令进行管理"
@@ -765,8 +982,7 @@ Install() {
     else
         echo -e "${Error} Shadowsocks Rust 启动失败，请检查日志！"
         echo -e "${Info} 您可以使用以下命令查看详细日志："
-        echo -e " - systemctl status ss-rust"
-        echo -e " - journalctl -xe --unit ss-rust"
+        print_service_debug_hint ss-rust
         Before_Start_Menu
     fi
 }
@@ -778,21 +994,22 @@ start_service() {
     echo -e "${INFO} 检查服务状态..."
     check_status
     if [[ "$status" == "running" ]]; then
+        return 0
         echo -e "${INFO} Shadowsocks Rust 已在运行！"
         return 1
     fi
     
     echo -e "${INFO} 正在启动 Shadowsocks Rust..."
-    systemctl start ss-rust
+    service_start ss-rust
     
     # 等待服务启动
     sleep 2
     
     # 检查服务状态和日志
-    if ! systemctl is-active ss-rust >/dev/null 2>&1; then
+    if ! service_is_active ss-rust; then
         echo -e "${ERROR} Shadowsocks Rust 启动失败！"
         echo -e "${INFO} 查看服务日志："
-        journalctl -xe --unit ss-rust
+        show_service_logs ss-rust
         return 1
     fi
     
@@ -807,14 +1024,14 @@ Stop() {
         echo -e "${Error} Shadowsocks Rust 没有运行，请检查！"
         return 1
     fi
-    systemctl stop ss-rust
+    service_stop ss-rust
     echo -e "${Info} Shadowsocks Rust 已停止！"
 }
 
 # 重启
 Restart() {
     check_installed_status || return 1
-    systemctl restart ss-rust
+    service_restart ss-rust
     echo -e "${Info} Shadowsocks Rust 重启完毕！"
 }
 
@@ -839,7 +1056,7 @@ Update() {
             echo -e "${Info} 开始更新 Shadowsocks Rust..."
             detect_arch
             download_ss "${new_ver#v}" "${OS_ARCH}"
-            systemctl restart ss-rust
+            service_restart ss-rust
             echo -e "${Success} Shadowsocks Rust 已更新到最新版本 [ ${new_ver} ]"
         else
             echo -e "${Info} 已取消更新"
@@ -861,8 +1078,10 @@ Uninstall() {
     [[ -z ${unyn} ]] && unyn="n"
     if [[ ${unyn} == [Yy] ]]; then
         check_status
-        [[ "$status" == "running" ]] && systemctl stop ss-rust
-        systemctl disable ss-rust
+        [[ "$status" == "running" ]] && service_stop ss-rust
+        service_disable ss-rust
+        service_reload
+        rm -f "${SYSTEMD_DIR}/ss-rust.service" "${OPENRC_DIR}/ss-rust"
         rm -rf "${INSTALL_DIR}"
         rm -rf "${BINARY_PATH}"
         rm -f "/usr/local/bin/ssrust"
@@ -906,14 +1125,22 @@ Link_QR() {
         SSurl="ss://${SSbase64}"
         link_ipv4=" 链接  [IPv4]：${Green_font_prefix}${SSurl}${Font_color_suffix}"
         echo -e "\n IPv4 二维码:"
-        echo "${SSurl}" | qrencode -t utf8
+        if command -v qrencode &> /dev/null; then
+            echo "${SSurl}" | qrencode -t utf8
+        else
+            echo -e "${Red_font_prefix}未安装 qrencode，无法生成二维码${Font_color_suffix}"
+        fi
     fi
     if [[ "${ipv6}" != "IPv6_Error" ]]; then
         SSbase64=$(urlsafe_base64 "${SS_METHOD}:${SS_PASSWORD}@${ipv6}:${SS_PORT}")
         SSurl="ss://${SSbase64}"
         link_ipv6=" 链接  [IPv6]：${Green_font_prefix}${SSurl}${Font_color_suffix}"
         echo -e "\n IPv6 二维码:"
-        echo "${SSurl}" | qrencode -t utf8
+        if command -v qrencode &> /dev/null; then
+            echo "${SSurl}" | qrencode -t utf8
+        else
+            echo -e "${Red_font_prefix}未安装 qrencode，无法生成二维码${Font_color_suffix}"
+        fi
     fi
 }
 
@@ -960,7 +1187,7 @@ View() {
     fi
 
     # 生成 SS 链接
-    local userinfo=$(echo -n "${config_method}:${config_password}" | base64 -w 0)
+    local userinfo=$(echo -n "${config_method}:${config_password}" | base64 | tr -d '\n')
     local ss_url_ipv4=""
     local ss_url_ipv6=""
     
@@ -998,10 +1225,12 @@ View() {
     fi
 
     # 检查 ShadowTLS 是否安装并获取配置
-    if [ -f "/etc/systemd/system/shadowtls-ss.service" ]; then
-        local stls_listen_port=$(grep -oP '(?<=--listen ::0:)\d+' /etc/systemd/system/shadowtls-ss.service)
-        local stls_password=$(grep -oP '(?<=--password )\S+' /etc/systemd/system/shadowtls-ss.service)
-        local stls_sni=$(grep -oP '(?<=--tls )\S+' /etc/systemd/system/shadowtls-ss.service)
+    local stls_service_file
+    stls_service_file=$(get_shadowtls_ss_service_file || true)
+    if [ -n "${stls_service_file}" ]; then
+        local stls_listen_port=$(extract_shadowtls_listen_port "${stls_service_file}")
+        local stls_password=$(extract_shadowtls_arg "${stls_service_file}" "password")
+        local stls_sni=$(extract_shadowtls_arg "${stls_service_file}" "tls")
 
         echo -e "\n${Yellow_font_prefix}=== ShadowTLS 配置 ===${Font_color_suffix}"
         echo -e " 监听端口：${Green_font_prefix}${stls_listen_port}${Font_color_suffix}"
@@ -1011,7 +1240,7 @@ View() {
 
         # 生成 SS + ShadowTLS 合并链接
         local shadow_tls_config="{\"version\":\"3\",\"password\":\"${stls_password}\",\"host\":\"${stls_sni}\",\"port\":\"${stls_listen_port}\",\"address\":\"${ipv4}\"}"
-        local shadow_tls_base64=$(echo -n "${shadow_tls_config}" | base64 -w 0)
+        local shadow_tls_base64=$(echo -n "${shadow_tls_config}" | base64 | tr -d '\n')
         local ss_stls_url="ss://${userinfo}@${ipv4}:${config_port}?shadow-tls=${shadow_tls_base64}#SS-${ipv4}"
 
         echo -e "\n${Yellow_font_prefix}=== SS + ShadowTLS 链接 ===${Font_color_suffix}"
@@ -1041,7 +1270,7 @@ View() {
 Status() {
     echo -e "${Info} 获取 Shadowsocks Rust 活动日志 ……"
     echo -e "${Tip} 返回主菜单请按 q ！"
-    systemctl status ss-rust
+    service_status ss-rust
     Start_Menu
 }
 

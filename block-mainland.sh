@@ -25,6 +25,7 @@ MMDB_FILE="${IPLIST_DIR}/Country.mmdb"
 IPTABLES_RULES="/etc/ss-rust/mainland_cn_rules.sh"
 EXTRACT_SCRIPT="$(cd "$(dirname "$0")"; pwd)/extract-cn-ip-from-mmdb.py"
 AUTO_UPDATE_CRON_FILE="/etc/cron.d/block-mainland-auto-update"
+ALPINE_AUTO_UPDATE_CRON_FILE="/etc/crontabs/root"
 AUTO_UPDATE_LOG_FILE="/var/log/block-mainland-update.log"
 DAILY_CRON_EXPR="30 4 * * *"
 WEEKLY_CRON_EXPR="30 4 * * 1"
@@ -44,6 +45,18 @@ readonly WARNING="${YELLOW}[警告]${PLAIN}"
 readonly SUCCESS="${GREEN}[成功]${PLAIN}"
 
 # 检查root权限
+is_alpine() {
+    grep -qi '^ID=alpine' /etc/os-release 2>/dev/null
+}
+
+get_auto_update_cron_file() {
+    if is_alpine; then
+        echo "$ALPINE_AUTO_UPDATE_CRON_FILE"
+    else
+        echo "$AUTO_UPDATE_CRON_FILE"
+    fi
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo -e "${ERROR} 此脚本需要root权限运行"
@@ -72,6 +85,9 @@ check_dependencies() {
         if command -v apt-get &> /dev/null; then
             apt-get update
             apt-get install -y "${missing_deps[@]}"
+        elif command -v apk &> /dev/null; then
+            apk update
+            apk add --no-cache "${missing_deps[@]}"
         elif command -v yum &> /dev/null; then
             yum install -y "${missing_deps[@]}"
         else
@@ -86,6 +102,8 @@ check_dependencies() {
         echo -e "${WARNING} pip未安装，正在安装..."
         if command -v apt-get &> /dev/null; then
             apt-get install -y python3-pip
+        elif command -v apk &> /dev/null; then
+            apk add --no-cache py3-pip
         elif command -v yum &> /dev/null; then
             yum install -y python3-pip
         fi
@@ -110,6 +128,11 @@ check_dependencies() {
         elif command -v yum &> /dev/null; then
             echo -e "${INFO} 安装编译依赖..."
             yum install -y python3-devel gcc 2>/dev/null || true
+        elif command -v apk &> /dev/null; then
+            echo -e "${INFO} Trying apk package py3-maxminddb..."
+            apk add --no-cache py3-maxminddb 2>/dev/null && echo -e "${SUCCESS} maxminddb installed" && return 0 || true
+            echo -e "${INFO} Installing build dependencies..."
+            apk add --no-cache python3-dev build-base 2>/dev/null || true
         fi
         
         # 用pip安装，添加--break-system-packages标志（用于Debian系统）
@@ -381,6 +404,8 @@ install_ipset() {
         
         if command -v apt-get &> /dev/null; then
             apt-get install -y ipset
+        elif command -v apk &> /dev/null; then
+            apk add --no-cache ipset
         elif command -v yum &> /dev/null; then
             yum install -y ipset
         fi
@@ -403,6 +428,7 @@ enable_blocking() {
     
     # 保存iptables规则（使用iptables-save/iptables-restore）
     if command -v iptables-save &> /dev/null; then
+        mkdir -p /etc/iptables
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     fi
     
@@ -535,6 +561,12 @@ normalize_schedule_input() {
 
 # 尝试确保系统的cron服务可用
 ensure_cron_service() {
+    if command -v rc-service >/dev/null 2>&1 && [ -x /etc/init.d/crond ]; then
+        rc-update add crond default >/dev/null 2>&1 || true
+        rc-service crond start >/dev/null 2>&1 || true
+        return 0
+    fi
+
     if ! command -v systemctl >/dev/null 2>&1; then
         return 0
     fi
@@ -595,13 +627,30 @@ enable_auto_update() {
 
     touch "$AUTO_UPDATE_LOG_FILE"
 
-    cat > "$AUTO_UPDATE_CRON_FILE" << EOF
+    local cron_file
+    cron_file=$(get_auto_update_cron_file)
+
+    if is_alpine; then
+        mkdir -p "$(dirname "$cron_file")"
+        touch "$cron_file"
+        local tmp_cron
+        tmp_cron=$(mktemp)
+        grep -vF "bash $script_exec_path update" "$cron_file" > "$tmp_cron" 2>/dev/null || true
+        mv "$tmp_cron" "$cron_file"
+        {
+            grep -q '^SHELL=' "$cron_file" 2>/dev/null || echo "SHELL=/bin/bash"
+            grep -q '^PATH=' "$cron_file" 2>/dev/null || echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            echo "$cron_expr PYTHONIOENCODING=UTF-8 LC_ALL=C.UTF-8 LANG=C.UTF-8 bash $script_exec_path update >> $AUTO_UPDATE_LOG_FILE 2>&1"
+        } >> "$cron_file"
+    else
+        cat > "$cron_file" << EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 $cron_expr root PYTHONIOENCODING=UTF-8 LC_ALL=C.UTF-8 LANG=C.UTF-8 bash $script_exec_path update >> $AUTO_UPDATE_LOG_FILE 2>&1
 EOF
+    fi
 
-    chmod 644 "$AUTO_UPDATE_CRON_FILE"
+    chmod 644 "$cron_file"
 
     echo -e "${SUCCESS} 定时更新已开启"
     echo -e "${INFO} 更新频率: $cron_expr"
@@ -610,8 +659,19 @@ EOF
 
 # 关闭定时更新
 disable_auto_update() {
-    if [ -f "$AUTO_UPDATE_CRON_FILE" ]; then
-        rm -f "$AUTO_UPDATE_CRON_FILE"
+    local cron_file
+    cron_file=$(get_auto_update_cron_file)
+    if [ -f "$cron_file" ]; then
+        if is_alpine; then
+            local script_exec_path
+            script_exec_path=$(get_script_exec_path)
+            local tmp_cron
+            tmp_cron=$(mktemp)
+            grep -vF "bash $script_exec_path update" "$cron_file" > "$tmp_cron" 2>/dev/null || true
+            mv "$tmp_cron" "$cron_file"
+        else
+            rm -f "$cron_file"
+        fi
         echo -e "${SUCCESS} 定时更新已关闭"
     else
         echo -e "${WARNING} 定时更新未启用"
@@ -624,15 +684,18 @@ show_auto_update_status() {
     echo -e "${BLUE}${BOLD}      定时更新任务状态${PLAIN}"
     echo -e "${BLUE}${BOLD}═══════════════════════════════════${PLAIN}"
 
-    if [ -f "$AUTO_UPDATE_CRON_FILE" ]; then
+    local cron_file
+    cron_file=$(get_auto_update_cron_file)
+
+    if [ -f "$cron_file" ]; then
         local cron_line
-        cron_line=$(grep -vE '^(#|SHELL=|PATH=|$)' "$AUTO_UPDATE_CRON_FILE" | head -1)
+        cron_line=$(grep -vE '^(#|SHELL=|PATH=|$)' "$cron_file" | grep -F "block-mainland" | head -1)
         local cron_expr
         cron_expr=$(echo "$cron_line" | awk '{print $1" "$2" "$3" "$4" "$5}')
 
         echo -e "${GREEN}✓${PLAIN} 已启用"
         echo -e "  调度表达式: $cron_expr"
-        echo -e "  任务文件: $AUTO_UPDATE_CRON_FILE"
+        echo -e "  任务文件: $cron_file"
     else
         echo -e "${RED}✗${PLAIN} 未启用"
     fi

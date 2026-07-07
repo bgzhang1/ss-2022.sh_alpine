@@ -16,8 +16,10 @@ RESET='\033[0m'
 # 定义系统路径
 INSTALL_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
+OPENRC_DIR="/etc/init.d"
 CONFIG_DIR="/etc/shadowtls"
 SERVICE_FILE="${SYSTEMD_DIR}/shadowtls.service"
+INIT_SYSTEM=""
 
 # 定义配置目录
 SNELL_CONF_DIR="/etc/snell"
@@ -34,11 +36,142 @@ check_root() {
 
 # 安装必要的工具
 install_requirements() {
-    apt update
-    apt install -y wget curl jq
+    if command -v apk >/dev/null 2>&1; then
+        apk update
+        apk add --no-cache bash wget curl jq coreutils net-tools ca-certificates openrc || true
+        apk add --no-cache qrencode >/dev/null 2>&1 || apk add --no-cache libqrencode-tools >/dev/null 2>&1 || true
+        update-ca-certificates >/dev/null 2>&1 || true
+        for cmd in bash wget curl jq shuf netstat; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+                echo -e "${RED}Missing required command after apk install: $cmd${RESET}"
+                exit 1
+            fi
+        done
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y wget curl jq qrencode
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y wget curl jq qrencode
+    else
+        echo -e "${RED}Unsupported package manager. Please install wget curl jq qrencode manually.${RESET}"
+        exit 1
+    fi
 }
 
 # 获取最新版本
+detect_init_system() {
+    if command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 && grep -qi '^ID=alpine' /etc/os-release 2>/dev/null; then
+        INIT_SYSTEM="openrc"
+    elif command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    else
+        echo -e "${RED}Unsupported service manager. Need systemd or OpenRC.${RESET}"
+        exit 1
+    fi
+}
+
+service_start() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl start "$1" ;;
+        openrc) rc-service "$1" start ;;
+    esac
+}
+
+service_stop() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl stop "$1" ;;
+        openrc) rc-service "$1" stop ;;
+    esac
+}
+
+service_restart() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl restart "$1" ;;
+        openrc) rc-service "$1" restart ;;
+    esac
+}
+
+service_enable() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl enable "$1" ;;
+        openrc) rc-update add "$1" default ;;
+    esac
+}
+
+service_disable() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl disable "$1" ;;
+        openrc) rc-update del "$1" default >/dev/null 2>&1 || true ;;
+    esac
+}
+
+service_is_active() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl is-active "$1" >/dev/null 2>&1 ;;
+        openrc) rc-service "$1" status >/dev/null 2>&1 ;;
+    esac
+}
+
+service_status() {
+    detect_init_system
+    case "${INIT_SYSTEM}" in
+        systemd) systemctl status "$1" --no-pager ;;
+        openrc) rc-service "$1" status ;;
+    esac
+}
+
+service_reload() {
+    detect_init_system
+    [[ "${INIT_SYSTEM}" == "systemd" ]] && systemctl daemon-reload
+    return 0
+}
+
+shadowtls_service_path() {
+    local service_name="$1"
+    if [[ -f "${SYSTEMD_DIR}/${service_name}.service" ]]; then
+        echo "${SYSTEMD_DIR}/${service_name}.service"
+    elif [[ -f "${OPENRC_DIR}/${service_name}" ]]; then
+        echo "${OPENRC_DIR}/${service_name}"
+    else
+        return 1
+    fi
+}
+
+list_shadowtls_service_files() {
+    find "${SYSTEMD_DIR}" -maxdepth 1 -name "shadowtls-snell-*.service" 2>/dev/null
+    find "${OPENRC_DIR}" -maxdepth 1 -name "shadowtls-snell-*" 2>/dev/null
+}
+
+service_file_to_name() {
+    local service_file="$1"
+    local service_name
+    service_name=$(basename "$service_file")
+    service_name=${service_name%.service}
+    echo "${service_name}"
+}
+
+service_file_to_port() {
+    service_file_to_name "$1" | sed 's/shadowtls-snell-\([0-9]*\)$/\1/'
+}
+
+extract_shadowtls_listen_port() {
+    sed -n 's/.*--listen[[:space:]]\+::0:\([0-9][0-9]*\).*/\1/p' "$1" | head -1
+}
+
+extract_shadowtls_arg() {
+    local file="$1"
+    local arg="$2"
+    sed -n "s/.*--${arg}[[:space:]]\\+\\([^[:space:]]*\\).*/\\1/p" "${file}" | head -1 | sed 's/^"//;s/"$//'
+}
+
 get_latest_version() {
     latest_version=$(curl -s "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" | jq -r .tag_name)
     if [ -z "$latest_version" ]; then
@@ -235,19 +368,20 @@ get_used_stls_ports() {
     local used_ports=()
     
     # 检查 SS 服务
-    local ss_service="${SYSTEMD_DIR}/shadowtls-ss.service"
+    local ss_service
+    ss_service=$(shadowtls_service_path "shadowtls-ss" 2>/dev/null || true)
     if [ -f "$ss_service" ]; then
-        local ss_port=$(grep -oP '(?<=--listen ::0:)\d+' "$ss_service")
+        local ss_port=$(extract_shadowtls_listen_port "$ss_service")
         if [ ! -z "$ss_port" ]; then
             used_ports+=("$ss_port")
         fi
     fi
     
     # 检查 Snell 服务
-    local snell_services=$(find /etc/systemd/system -name "shadowtls-snell-*.service" 2>/dev/null)
+    local snell_services=$(list_shadowtls_service_files)
     if [ ! -z "$snell_services" ]; then
         while IFS= read -r service_file; do
-            local port=$(grep -oP '(?<=--listen ::0:)\d+' "$service_file")
+            local port=$(extract_shadowtls_listen_port "$service_file")
             if [ ! -z "$port" ]; then
                 used_ports+=("$port")
             fi
@@ -360,7 +494,11 @@ generate_ss_links() {
     echo -e "${GREEN}SS + ShadowTLS 链接：${RESET}${ss_url}"
     
     echo -e "\n${YELLOW}=== Shadowrocket二维码 ===${RESET}"
-    qrencode -t UTF8 "${ss_url}"
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t UTF8 "${ss_url}"
+    else
+        echo -e "${YELLOW}qrencode is not installed; QR code skipped.${RESET}"
+    fi
     
     echo -e "\n${YELLOW}=== Clash Meta 配置 ===${RESET}"
     echo -e "proxies:"
@@ -420,20 +558,29 @@ create_shadowtls_service() {
     local tls_domain=$4
     local password=$5
     local service_file
+    local service_name
     local description
     local identifier
+    detect_init_system
     
     if [ "$service_type" = "ss" ]; then
-        service_file="${SYSTEMD_DIR}/shadowtls-ss.service"
+        service_name="shadowtls-ss"
         description="Shadow-TLS Server Service for Shadowsocks"
         identifier="shadow-tls-ss"
     else
-        service_file="${SYSTEMD_DIR}/shadowtls-snell-${port}.service"
+        service_name="shadowtls-snell-${port}"
         description="Shadow-TLS Server Service for Snell (Port: ${port})"
         identifier="shadow-tls-snell-${port}"
     fi
+
+    if [[ "${INIT_SYSTEM}" == "systemd" ]]; then
+        service_file="${SYSTEMD_DIR}/${service_name}.service"
+    else
+        service_file="${OPENRC_DIR}/${service_name}"
+    fi
     
-    cat > "$service_file" << EOF
+    if [[ "${INIT_SYSTEM}" == "systemd" ]]; then
+        cat > "$service_file" << EOF
 [Unit]
 Description=${description}
 Documentation=man:sstls-server
@@ -483,6 +630,37 @@ Environment=RUST_LOG_FILTER=info,shadow_tls=info
 [Install]
 WantedBy=multi-user.target
 EOF
+    else
+        cat > "$service_file" << EOF
+#!/sbin/openrc-run
+name="${service_name}"
+description="${description}"
+
+command="/usr/local/bin/shadow-tls"
+command_args="--v3 server --listen ::0:${listen_port} --server 127.0.0.1:${port} --tls ${tls_domain} --password ${password}"
+command_user="root"
+command_background="yes"
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/shadowtls-${identifier}.log"
+error_log="/var/log/shadowtls-${identifier}.log"
+
+export RUST_BACKTRACE=1
+export RUST_LOG=info
+export RUST_THREADS=1
+export MONOIO_FORCE_LEGACY_DRIVER=1
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --mode 0755 /run
+    checkpath --file --mode 0640 "\${output_log}"
+}
+EOF
+        chmod +x "$service_file"
+    fi
 
     # 创建日志文件并设置权限
     touch "/var/log/shadowtls-${identifier}.log"
@@ -492,6 +670,7 @@ EOF
 
 # 安装 ShadowTLS
 install_shadowtls() {
+    install_requirements
     echo -e "${CYAN}正在安装 ShadowTLS...${RESET}"
     
     # 检测已安装的协议
@@ -619,8 +798,8 @@ install_shadowtls() {
         # 创建 SS 的 ShadowTLS 服务
         local ss_port=$(get_ssrust_port)
         create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
-        systemctl start shadowtls-ss
-        systemctl enable shadowtls-ss
+        service_start shadowtls-ss
+        service_enable shadowtls-ss
     fi
     
     # 配置 Snell
@@ -674,8 +853,8 @@ install_shadowtls() {
                 
                 # 创建服务文件
                 create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
-                systemctl start "shadowtls-snell-${port}"
-                systemctl enable "shadowtls-snell-${port}"
+                service_start "shadowtls-snell-${port}"
+                service_enable "shadowtls-snell-${port}"
             done
         elif [[ "$port_choice" =~ ^[0-9]+$ ]] && [ "$port_choice" -ge 1 ] && [ "$port_choice" -le ${#port_list[@]} ]; then
             # 为选中的端口配置 ShadowTLS
@@ -696,8 +875,8 @@ install_shadowtls() {
             
             # 创建服务文件
             create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
-            systemctl start "shadowtls-snell-${selected_port}"
-            systemctl enable "shadowtls-snell-${selected_port}"
+            service_start "shadowtls-snell-${selected_port}"
+            service_enable "shadowtls-snell-${selected_port}"
         else
             echo -e "${RED}无效的选择${RESET}"
             return 1
@@ -705,7 +884,7 @@ install_shadowtls() {
     fi
     
     # 重新加载 systemd 配置
-    systemctl daemon-reload
+    service_reload
     
     # 获取服务器IP
     local server_ip=$(get_server_ip)
@@ -723,9 +902,10 @@ install_shadowtls() {
     if $configure_snell; then
         while IFS='|' read -r port psk; do
             if [ ! -z "$port" ]; then
-                local service_file="${SYSTEMD_DIR}/shadowtls-snell-${port}.service"
+                local service_file
+                service_file=$(shadowtls_service_path "shadowtls-snell-${port}" 2>/dev/null || true)
                 if [ -f "$service_file" ]; then
-                    local stls_port=$(grep -oP '(?<=--listen ::0:)\d+' "$service_file")
+                    local stls_port=$(extract_shadowtls_listen_port "$service_file")
                     generate_snell_links "${server_ip}" "${stls_port}" "${psk}" "${password}" "${tls_domain}" "${port}"
                 fi
             fi
@@ -740,19 +920,21 @@ uninstall_shadowtls() {
     echo -e "${CYAN}正在卸载 ShadowTLS...${RESET}"
     
     # 停止并禁用 SS 服务
-    if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
-        systemctl stop shadowtls-ss 2>/dev/null
-        systemctl disable shadowtls-ss 2>/dev/null
-        rm -f "${SYSTEMD_DIR}/shadowtls-ss.service"
+    local ss_service
+    ss_service=$(shadowtls_service_path "shadowtls-ss" 2>/dev/null || true)
+    if [ -n "$ss_service" ]; then
+        service_stop shadowtls-ss 2>/dev/null || true
+        service_disable shadowtls-ss 2>/dev/null || true
+        rm -f "${SYSTEMD_DIR}/shadowtls-ss.service" "${OPENRC_DIR}/shadowtls-ss"
     fi
     
     # 停止并禁用所有 Snell 相关的 ShadowTLS 服务
-    local snell_services=$(find /etc/systemd/system -name "shadowtls-snell-*.service" 2>/dev/null)
+    local snell_services=$(list_shadowtls_service_files)
     if [ ! -z "$snell_services" ]; then
         while IFS= read -r service_file; do
-            local service_name=$(basename "$service_file")
-            systemctl stop "$service_name" 2>/dev/null
-            systemctl disable "$service_name" 2>/dev/null
+            local service_name=$(service_file_to_name "$service_file")
+            service_stop "$service_name" 2>/dev/null || true
+            service_disable "$service_name" 2>/dev/null || true
             rm -f "$service_file"
         done <<< "$snell_services"
     fi
@@ -761,7 +943,7 @@ uninstall_shadowtls() {
     rm -f "$INSTALL_DIR/shadow-tls"
     
     # 重新加载 systemd 配置
-    systemctl daemon-reload
+    service_reload
     
     echo -e "${GREEN}ShadowTLS 已成功卸载${RESET}"
 }
@@ -771,8 +953,9 @@ view_config() {
     echo -e "${CYAN}正在获取配置信息...${RESET}"
     
     # 检查服务是否安装
-    local ss_service="${SYSTEMD_DIR}/shadowtls-ss.service"
-    local snell_services=$(find /etc/systemd/system -name "shadowtls-snell-*.service" 2>/dev/null | sort -u)
+    local ss_service
+    ss_service=$(shadowtls_service_path "shadowtls-ss" 2>/dev/null || true)
+    local snell_services=$(list_shadowtls_service_files | sort -u)
     
     if [ ! -f "$ss_service" ] && [ -z "$snell_services" ]; then
         echo -e "${RED}ShadowTLS 未安装${RESET}"
@@ -785,9 +968,9 @@ view_config() {
     # 检查 SS 是否安装并获取配置
     if [ -f "$ss_service" ] && check_ssrust; then
         echo -e "\n${YELLOW}=== Shadowsocks + ShadowTLS 配置 ===${RESET}"
-        local ss_listen_port=$(grep -oP '(?<=--listen ::0:)\d+' "$ss_service")
-        local tls_domain=$(grep -oP '(?<=--tls )[^ ]+' "$ss_service")
-        local password=$(grep -oP '(?<=--password )[^ ]+' "$ss_service")
+        local ss_listen_port=$(extract_shadowtls_listen_port "$ss_service")
+        local tls_domain=$(extract_shadowtls_arg "$ss_service" "tls")
+        local password=$(extract_shadowtls_arg "$ss_service" "password")
         local ss_port=$(get_ssrust_port)
         local ssrust_password=$(get_ssrust_password)
         local ssrust_method=$(get_ssrust_method)
@@ -814,12 +997,12 @@ view_config() {
                     processed_ports[$port]=1
                     
                     # 获取对应的 ShadowTLS 服务配置
-                    local service_file="${SYSTEMD_DIR}/shadowtls-snell-${port}.service"
+                    local service_file
+                    service_file=$(shadowtls_service_path "shadowtls-snell-${port}" 2>/dev/null || true)
                     if [ -f "$service_file" ]; then
-                        local exec_line=$(grep "ExecStart=" "$service_file")
-                        local stls_port=$(echo "$exec_line" | grep -oP '(?<=--listen ::0:)\d+')
-                        local stls_password=$(echo "$exec_line" | grep -oP '(?<=--password )[^ ]+')
-                        local stls_domain=$(echo "$exec_line" | grep -oP '(?<=--tls )[^ ]+')
+                        local stls_port=$(extract_shadowtls_listen_port "$service_file")
+                        local stls_password=$(extract_shadowtls_arg "$service_file" "password")
+                        local stls_domain=$(extract_shadowtls_arg "$service_file" "tls")
                         
                         if [ "$port" = "$(get_snell_port)" ]; then
                             echo -e "\n${GREEN}主用户配置：${RESET}"
@@ -848,8 +1031,7 @@ view_config() {
                             fi
                             
                             # 检查服务状态
-                            local service_status=$(systemctl is-active "shadowtls-snell-${port}")
-                            if [ "$service_status" = "active" ]; then
+                            if service_is_active "shadowtls-snell-${port}"; then
                                 echo -e "\n${GREEN}服务状态：正在运行${RESET}"
                                 # 检查端口占用情况
                                 local port_usage=$(netstat -tuln | grep ":${stls_port}")
@@ -862,7 +1044,7 @@ view_config() {
                             else
                                 echo -e "\n${RED}服务状态：未运行${RESET}"
                                 echo -e "${YELLOW}请尝试以下命令重启服务：${RESET}"
-                                echo -e "systemctl restart shadowtls-snell-${port}"
+                                echo -e "service_restart shadowtls-snell-${port}"
                             fi
                         else
                             echo -e "${RED}配置文件不完整或已损坏${RESET}"
@@ -883,12 +1065,12 @@ view_config() {
     # 显示 SS 服务状态
     if [ -f "$ss_service" ]; then
         echo -e "\n${YELLOW}SS 服务状态：${RESET}"
-        systemctl status shadowtls-ss --no-pager
+        service_status shadowtls-ss
         
         # 如果服务未运行，显示重启命令
-        if [ "$(systemctl is-active shadowtls-ss)" != "active" ]; then
+        if ! service_is_active shadowtls-ss; then
             echo -e "\n${YELLOW}SS 服务未运行，请尝试以下命令重启：${RESET}"
-            echo -e "systemctl restart shadowtls-ss"
+            echo -e "service_restart shadowtls-ss"
         fi
     fi
     
@@ -897,16 +1079,16 @@ view_config() {
         echo -e "\n${YELLOW}Snell 服务状态：${RESET}"
         declare -A shown_services
         while IFS= read -r service_file; do
-            local port=$(basename "$service_file" | sed 's/shadowtls-snell-\([0-9]*\)\.service/\1/')
+            local port=$(service_file_to_port "$service_file")
             if [ -z "${shown_services[$port]}" ]; then
                 shown_services[$port]=1
                 echo -e "\n${GREEN}Snell 端口 ${port} 的 ShadowTLS 服务状态：${RESET}"
-                systemctl status "shadowtls-snell-${port}" --no-pager
+                service_status "shadowtls-snell-${port}"
                 
                 # 如果服务未运行，显示重启命令
-                if [ "$(systemctl is-active shadowtls-snell-${port})" != "active" ]; then
+                if ! service_is_active "shadowtls-snell-${port}"; then
                     echo -e "\n${YELLOW}服务未运行，请尝试以下命令重启：${RESET}"
-                    echo -e "systemctl restart shadowtls-snell-${port}"
+                    echo -e "service_restart shadowtls-snell-${port}"
                 fi
             fi
         done <<< "$snell_services"
@@ -925,7 +1107,7 @@ add_shadowtls_config() {
     if check_ssrust; then
         has_ss=true
         echo -e "${GREEN}检测到已安装 Shadowsocks Rust${RESET}"
-        if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
+        if shadowtls_service_path "shadowtls-ss" >/dev/null 2>&1; then
             has_ss_stls=true
             echo -e "${YELLOW}已存在 Shadowsocks 的 ShadowTLS 配置${RESET}"
         fi
@@ -985,8 +1167,8 @@ add_shadowtls_config() {
                 # 创建 SS 的 ShadowTLS 服务
                 local ss_port=$(get_ssrust_port)
                 create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
-                systemctl start shadowtls-ss
-                systemctl enable shadowtls-ss
+                service_start shadowtls-ss
+                service_enable shadowtls-ss
                 
                 # 显示配置信息
                 local server_ip=$(get_server_ip)
@@ -1020,7 +1202,7 @@ add_shadowtls_config() {
                 local port_list=()
                 local port_count=0
                 while IFS='|' read -r port psk; do
-                    if [ ! -z "$port" ] && [ ! -f "${SYSTEMD_DIR}/shadowtls-snell-${port}.service" ]; then
+                    if [ ! -z "$port" ] && ! shadowtls_service_path "shadowtls-snell-${port}" >/dev/null 2>&1; then
                         port_list+=("$port")
                         if [ "$port" = "$(get_snell_port)" ]; then
                             echo -e "${GREEN}$((++port_count)). ${port} (主用户)${RESET}"
@@ -1059,8 +1241,8 @@ add_shadowtls_config() {
                         
                         # 创建服务文件
                         create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
-                        systemctl start "shadowtls-snell-${port}"
-                        systemctl enable "shadowtls-snell-${port}"
+                        service_start "shadowtls-snell-${port}"
+                        service_enable "shadowtls-snell-${port}"
                         
                         # 显示配置信息
                         local server_ip=$(get_server_ip)
@@ -1084,8 +1266,8 @@ add_shadowtls_config() {
                     
                     # 创建服务文件
                     create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
-                    systemctl start "shadowtls-snell-${selected_port}"
-                    systemctl enable "shadowtls-snell-${selected_port}"
+                    service_start "shadowtls-snell-${selected_port}"
+                    service_enable "shadowtls-snell-${selected_port}"
                     
                     # 显示配置信息
                     local server_ip=$(get_server_ip)
@@ -1104,7 +1286,7 @@ add_shadowtls_config() {
     done
     
     # 重新加载 systemd 配置
-    systemctl daemon-reload
+    service_reload
     echo -e "\n${GREEN}新增配置完成${RESET}"
 }
 
@@ -1115,10 +1297,10 @@ restart_shadowtls_services() {
     local has_services=false
     
     # 重启 SS 服务
-    if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
+    if shadowtls_service_path "shadowtls-ss" >/dev/null 2>&1; then
         has_services=true
         echo -e "\n${YELLOW}重启 Shadowsocks 的 ShadowTLS 服务...${RESET}"
-        systemctl restart shadowtls-ss
+        service_restart shadowtls-ss
         if [ $? -eq 0 ]; then
             echo -e "${GREEN}Shadowsocks ShadowTLS 服务重启成功${RESET}"
         else
@@ -1127,14 +1309,14 @@ restart_shadowtls_services() {
     fi
     
     # 重启所有 Snell 服务
-    local snell_services=$(find /etc/systemd/system -name "shadowtls-snell-*.service" 2>/dev/null)
+    local snell_services=$(list_shadowtls_service_files)
     if [ ! -z "$snell_services" ]; then
         has_services=true
         echo -e "\n${YELLOW}重启 Snell 的 ShadowTLS 服务...${RESET}"
         while IFS= read -r service_file; do
-            local port=$(basename "$service_file" | sed 's/shadowtls-snell-\([0-9]*\)\.service/\1/')
+            local port=$(service_file_to_port "$service_file")
             echo -e "重启端口 ${port} 的服务..."
-            systemctl restart "shadowtls-snell-${port}"
+            service_restart "shadowtls-snell-${port}"
             if [ $? -eq 0 ]; then
                 echo -e "${GREEN}端口 ${port} 的服务重启成功${RESET}"
             else
@@ -1152,16 +1334,16 @@ restart_shadowtls_services() {
     
     # 显示所有服务状态
     echo -e "\n${YELLOW}服务状态：${RESET}"
-    if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
+    if shadowtls_service_path "shadowtls-ss" >/dev/null 2>&1; then
         echo -e "\n${CYAN}Shadowsocks ShadowTLS 服务状态：${RESET}"
-        systemctl status shadowtls-ss --no-pager
+        service_status shadowtls-ss
     fi
     
     if [ ! -z "$snell_services" ]; then
         while IFS= read -r service_file; do
-            local port=$(basename "$service_file" | sed 's/shadowtls-snell-\([0-9]*\)\.service/\1/')
+            local port=$(service_file_to_port "$service_file")
             echo -e "\n${CYAN}Snell 端口 ${port} 的 ShadowTLS 服务状态：${RESET}"
-            systemctl status "shadowtls-snell-${port}" --no-pager
+            service_status "shadowtls-snell-${port}"
         done <<< "$snell_services"
     fi
 }

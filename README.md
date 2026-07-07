@@ -11,9 +11,13 @@ bash <(curl -L -s menu.jinqians.com)
 ```bash
 bash <(curl -L -s ss.jinqians.com)
 ```
++ Alpine/OpenRC 适配版本（本仓库）
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/bgzhang1/ss-2022.sh_alpine/main/ss-2022.sh)
+```
 + 下载脚本，本地执行
 ```bash
-wget -N --no-check-certificate https://raw.githubusercontent.com/jinqians/ss-2022.sh/main/ss-2022.sh && chmod +x ss-2022.sh && ./ss-2022.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/bgzhang1/ss-2022.sh_alpine/main/ss-2022.sh && chmod +x ss-2022.sh && ./ss-2022.sh
 ```
 
 # Shadowsocks Rust + ShadowTLS 安装管理脚本
@@ -27,12 +31,32 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/jinqians/ss-202
 - 自动生成配置信息和分享链接
 - 支持多种加密方式
 - 支持多客户端配置格式
+- 支持 Alpine Linux，自动使用 musl 版本二进制并通过 OpenRC 管理服务
 
 ## 系统要求
 
-- 支持的操作系统：Debian / Ubuntu / CentOS
+- 支持的操作系统：Debian / Ubuntu / CentOS / Alpine Linux
+- 服务管理器：systemd 或 OpenRC（Alpine）
 - 需要 root 权限
 - 需要 curl、wget、jq 等基础工具
+
+## Alpine 支持说明
+
+本仓库已适配 Alpine Linux：
+
+- Shadowsocks Rust 自动下载 `*-unknown-linux-musl` 版本
+- `ss-rust`、`shadowtls-ss` 和 `shadowtls-snell-*` 使用 OpenRC 服务脚本
+- 依赖通过 `apk` 安装，`qrencode` 缺失时会跳过二维码生成，不影响服务安装
+- 中国大陆 IP 屏蔽脚本支持 `apk`、OpenRC `crond` 和 Alpine 的 `/etc/crontabs/root`
+
+Alpine 常用命令：
+
+```bash
+rc-service ss-rust status
+rc-service ss-rust restart
+rc-service shadowtls-ss status
+rc-update show default
+```
 
 ## 主要功能
 
@@ -146,11 +170,19 @@ systemctl status psm-traffic.timer
 ## 问题排查
 
 如果遇到问题，可以：
-1. 查看服务状态：`systemctl status ss-rust`
-2. 查看服务日志：`journalctl -xe --unit ss-rust`
-3. 查看 ShadowTLS 状态：`systemctl status shadowtls`
+1. systemd 查看 SS 状态：`systemctl status ss-rust`
+2. systemd 查看 SS 日志：`journalctl -xe --unit ss-rust`
+3. Alpine/OpenRC 查看 SS 状态：`rc-service ss-rust status`
+4. Alpine/OpenRC 查看 SS 日志：`tail -n 80 /var/log/ss-rust.err /var/log/ss-rust.log`
+5. Alpine/OpenRC 查看 ShadowTLS 状态：`rc-service shadowtls-ss status`
 
 ## 更新日志
+
+### Alpine 适配版
+- 添加 Alpine Linux / OpenRC 支持
+- Shadowsocks Rust 自动选择 musl 架构包
+- ShadowTLS 服务支持 OpenRC
+- 大陆 IP 屏蔽脚本支持 `apk` 和 Alpine crond
 
 ### v1.3.0
 - 添加 ShadowTLS 支持
